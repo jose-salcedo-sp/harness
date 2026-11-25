@@ -49,6 +49,40 @@ The toolchain is pinned in `rust-toolchain.toml`; `rustup` installs it automatic
 GPUI needs system libraries. On Debian/Ubuntu, install the same packages CI does
 (see the "Install GPUI system dependencies" step in `.github/workflows/ci.yml`).
 
+## Running the app
+
+The window talks to any OpenAI-compatible chat-completions server. By default it
+expects `llama-server` (llama.cpp) serving a Bonsai 2 model on its default address:
+
+```sh
+llama-server -m <bonsai-2-9b.gguf> -c 32768 --jinja   # in another terminal
+cargo run -p harness-app
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `HARNESS_BASE_URL` | `http://127.0.0.1:8080/v1` | Server base URL. |
+| `HARNESS_API_KEY` | unset | Sent as `Authorization: Bearer …`; a local server needs none. |
+| `HARNESS_MODELS` | Bonsai 2 9B/4B/2B at 32k | Model picker entries, `id=context_tokens,…`; the first is selected. |
+| `HARNESS_WORKSPACE` | current directory | The only directory the `read_file` tool may read. |
+| `HARNESS_PROVIDER` | `openai` | `fake` selects the offline provider (same as `--fake`). |
+
+To run without a model server, use the deterministic fake provider. It echoes
+messages, and a message containing `read <path>` makes it call the `read_file` tool:
+
+```sh
+cargo run -p harness-app -- --fake
+# or: HARNESS_PROVIDER=fake cargo run -p harness-app
+```
+
+On a headless Linux machine, run it under Xvfb (`mesa-vulkan-drivers` provides a
+software Vulkan driver), for example to take a screenshot:
+
+```sh
+Xvfb :99 -screen 0 1280x860x24 & DISPLAY=:99 cargo run -p harness-app -- --fake
+DISPLAY=:99 import -window "$(DISPLAY=:99 xdotool search --name Harness)" shot.png
+```
+
 ## Rules
 
 Follow [`CODING_STANDARDS.md`](CODING_STANDARDS.md). The short version:

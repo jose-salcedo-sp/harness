@@ -192,7 +192,7 @@ fn summarize_file(content: &str) -> String {
     }
     let preview: Vec<&str> = content.lines().take(6).collect();
     format!(
-        "The file has {} lines ({} bytes). It starts with:\n\n{}",
+        "The file has {} lines ({} bytes). It starts with:\n\n```\n{}\n```",
         content.lines().count(),
         content.len(),
         preview.join("\n")
