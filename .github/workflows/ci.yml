@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # Installs the toolchain pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+
+  check:
+    name: clippy, test, doc
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # System libraries GPUI links against on Linux (X11, Wayland, Vulkan,
+      # fonts). Installed now so adding `gpui` to harness-app needs no CI change.
+      - name: Install GPUI system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev \
+            libvulkan-dev mesa-vulkan-drivers \
+            libssl-dev libzstd-dev libasound2-dev
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: doc tests
+        run: cargo test --workspace --doc --all-features --locked
+      - name: rustdoc
+        run: cargo doc --workspace --no-deps --all-features --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

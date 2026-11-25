@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jose-salcedo-sp/harness"
+publish = false
+
+[workspace.dependencies]
+
+# Cargo's own lints are not covered by `-D warnings`, so deny them here.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unused_qualifications = "warn"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Pedantic opt-outs. Each departs from pedantic's default for a stated reason.
+# `#[must_use]` on every pure fn buries the ones that matter; we add it where
+# ignoring the result is a bug (C-MUST-USE in the API guidelines).
+must_use_candidate = "allow"
+
+# Panics in non-test code. `clippy.toml` exempts `#[cfg(test)]` code.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "warn"
+dbg_macro = "deny"
+indexing_slicing = "warn"
+exit = "warn"
+
+# Every lint override must say why (see CODING_STANDARDS.md "Lint overrides").
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+
+# Small hygiene lints from the restriction group.
+clone_on_ref_ptr = "warn"
+mem_forget = "warn"
+rc_buffer = "warn"
+str_to_string = "warn"
+undocumented_unsafe_blocks = "warn"

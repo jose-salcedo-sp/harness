@@ -1,0 +1,14 @@
+[package]
+name = "harness-core"
+description = "UI-free agent-loop backend for the harness chatbot."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
