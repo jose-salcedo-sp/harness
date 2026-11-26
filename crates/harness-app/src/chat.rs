@@ -38,7 +38,7 @@ use gpui_kit::{
 use harness_core::{
     AgentEvent, AgentLoop, Command, ContextUsage, FileIndex, FileMatch, FileMention, FsTools,
     ModelCatalog, ModelId, ModelInfo, ModelProvider, Session, ToolCall, ToolCallId, ToolOutcome,
-    ToolRequest, TurnFailure, UserText, WorkspacePath, match_files,
+    ToolRequest, TurnFailure, UserText, WorkspacePath, WriteKind, match_files,
 };
 
 use crate::file_popup::{FilePopup, Step, Transition};
@@ -1165,7 +1165,9 @@ fn thought_summary(elapsed: Duration) -> String {
 
 fn tool_entry(call: &ToolCall) -> ToolEntry {
     let target = match ToolRequest::parse(call) {
-        Ok(ToolRequest::ReadFile { path }) => Some(path.display().to_string()),
+        Ok(ToolRequest::ReadFile { path } | ToolRequest::WriteFile { path, .. }) => {
+            Some(path.display().to_string())
+        }
         Err(_) => None,
     };
     ToolEntry {
@@ -1179,14 +1181,22 @@ fn tool_entry(call: &ToolCall) -> ToolEntry {
 fn tool_state(outcome: &ToolOutcome) -> ToolState {
     match outcome {
         ToolOutcome::Succeeded { output } => {
-            let text = output.as_str();
-            ToolState::Succeeded {
-                summary: format!(
+            let summary = if let Some(write) = output.file_write() {
+                let verb = match write.kind {
+                    WriteKind::Created => "created",
+                    WriteKind::Overwritten => "updated",
+                };
+                let bytes = usize::try_from(write.bytes).unwrap_or(usize::MAX);
+                format!("{verb} · {}", compact_bytes(bytes))
+            } else {
+                let text = output.as_str();
+                format!(
                     "{} lines · {}",
                     text.lines().count(),
                     compact_bytes(text.len())
-                ),
-            }
+                )
+            };
+            ToolState::Succeeded { summary }
         }
         ToolOutcome::Failed { error } => ToolState::Failed {
             message: error.to_string(),
@@ -1312,5 +1322,37 @@ mod tests {
         assert_eq!(compact_bytes(512), "512 B");
         assert_eq!(compact_bytes(1_536), "1.5 KB");
         assert_eq!(compact_bytes(20_480), "20 KB");
+    }
+
+    #[test]
+    fn write_chip_shows_path_kind_and_size() {
+        use harness_core::{FileWrite, ToolArguments, ToolName, ToolOutput};
+
+        let call = ToolCall {
+            id: ToolCallId::new("c1").unwrap(),
+            name: ToolName::new("write_file").unwrap(),
+            arguments: ToolArguments::new(r#"{"path":"src/new.rs","contents":"x"}"#),
+        };
+        assert_eq!(tool_entry(&call).target.as_deref(), Some("src/new.rs"));
+
+        let outcome = |kind| ToolOutcome::Succeeded {
+            output: ToolOutput::written(FileWrite::new(
+                "src/new.rs".into(),
+                kind,
+                &"a".repeat(1_536),
+            )),
+        };
+        assert_eq!(
+            tool_state(&outcome(WriteKind::Created)),
+            ToolState::Succeeded {
+                summary: "created · 1.5 KB".to_owned()
+            }
+        );
+        assert_eq!(
+            tool_state(&outcome(WriteKind::Overwritten)),
+            ToolState::Succeeded {
+                summary: "updated · 1.5 KB".to_owned()
+            }
+        );
     }
 }

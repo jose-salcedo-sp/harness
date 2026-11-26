@@ -70,7 +70,9 @@ enum Behavior {
 ///
 /// - [`FakeProvider::scripted`] replays fixed responses, one per request.
 /// - [`FakeProvider::echo`] follows simple rules, so the app can be driven by
-///   hand: a message containing `read <path>` calls the `read_file` tool, a
+///   hand: a message starting with `write <path> <text>` calls the
+///   `write_file` tool with `<text>` as the contents (`\n` becomes a line
+///   break), a message containing `read <path>` calls the `read_file` tool, a
 ///   tool result is summarized, and anything else is echoed back. Every echo
 ///   response starts with a short reasoning trace explaining the rule it took.
 ///
@@ -172,28 +174,51 @@ fn echo_reply(request: &ModelRequest) -> Vec<ModelChunk> {
             .map(Message::char_len)
             .sum::<usize>();
     let (reasoning, reply) = match request.messages.last() {
-        Some(Message::User(text)) => match requested_path(text.as_str()) {
-            Some(path) => (
-                format!(
-                    "The user wants to know what is in `{path}`. I can't answer from memory, \
-                     so I'll call read_file with that path and summarize the result."
-                ),
-                EchoReply::ReadFile(path),
-            ),
-            None => (
-                "There is no file to read in this message, so I'll echo it back and explain \
-                 how to try the read_file tool."
-                    .to_owned(),
-                EchoReply::Text(format!(
-                    "You said: \"{text}\"\n\nI'm the offline fake provider, so I only echo. \
-                     Ask me to `read <path>` to watch the loop call the read_file tool."
-                )),
-            ),
-        },
-        Some(Message::Tool { content, .. }) => (
-            tool_result_reasoning(content),
-            EchoReply::Text(summarize_file(content)),
-        ),
+        Some(Message::User(text)) => {
+            if let Some((path, contents)) = requested_write(text.as_str()) {
+                (
+                    format!(
+                        "The user wants `{path}` to hold the text they gave. write_file \
+                         replaces the whole file, so I'll send that text as the complete \
+                         contents."
+                    ),
+                    EchoReply::WriteFile { path, contents },
+                )
+            } else if let Some(path) = requested_path(text.as_str()) {
+                (
+                    format!(
+                        "The user wants to know what is in `{path}`. I can't answer from \
+                         memory, so I'll call read_file with that path and summarize the \
+                         result."
+                    ),
+                    EchoReply::ReadFile(path),
+                )
+            } else {
+                (
+                    "There is no file to read or write in this message, so I'll echo it \
+                     back and explain how to try the file tools."
+                        .to_owned(),
+                    EchoReply::Text(format!(
+                        "You said: \"{text}\"\n\nI'm the offline fake provider, so I only \
+                         echo. Ask me to `read <path>` or `write <path> <text>` to watch the \
+                         loop call the read_file or write_file tool."
+                    )),
+                )
+            }
+        }
+        Some(Message::Tool { call_id, content }) => {
+            if tool_name(&request.messages, call_id) == Some(WRITE_FILE) {
+                (
+                    write_result_reasoning(content),
+                    EchoReply::Text(summarize_write(content)),
+                )
+            } else {
+                (
+                    tool_result_reasoning(content),
+                    EchoReply::Text(summarize_file(content)),
+                )
+            }
+        }
         Some(Message::Assistant { .. }) | None => (
             "Nothing to respond to yet, so I'll just say hello.".to_owned(),
             EchoReply::Text("Hello!".to_owned()),
@@ -214,18 +239,12 @@ fn echo_reply(request: &ModelRequest) -> Vec<ModelChunk> {
                 text.len()
             }
             EchoReply::ReadFile(path) => {
-                let arguments = serde_json::json!({ "path": path }).to_string();
-                let len = arguments.len();
-                let id = ToolCallId::new(format!("call_{}", request.messages.len()));
-                let name = ToolName::new("read_file");
-                if let (Ok(id), Ok(name)) = (id, name) {
-                    chunks.push(ModelChunk::ToolCall(ToolCall {
-                        id,
-                        name,
-                        arguments: ToolArguments::new(arguments),
-                    }));
-                }
-                len
+                let arguments = serde_json::json!({ "path": path });
+                push_tool_call(&mut chunks, request, READ_FILE, &arguments)
+            }
+            EchoReply::WriteFile { path, contents } => {
+                let arguments = serde_json::json!({ "path": path, "contents": contents });
+                push_tool_call(&mut chunks, request, WRITE_FILE, &arguments)
             }
         };
     chunks.push(ModelChunk::Usage(TokenUsage {
@@ -235,9 +254,81 @@ fn echo_reply(request: &ModelRequest) -> Vec<ModelChunk> {
     chunks
 }
 
+const READ_FILE: &str = "read_file";
+const WRITE_FILE: &str = "write_file";
+
+/// Streams a call to `tool`; returns the characters "generated".
+fn push_tool_call(
+    chunks: &mut Vec<ModelChunk>,
+    request: &ModelRequest,
+    tool: &str,
+    arguments: &serde_json::Value,
+) -> usize {
+    let arguments = arguments.to_string();
+    let len = arguments.len();
+    let id = ToolCallId::new(format!("call_{}", request.messages.len()));
+    let name = ToolName::new(tool);
+    if let (Ok(id), Ok(name)) = (id, name) {
+        chunks.push(ModelChunk::ToolCall(ToolCall {
+            id,
+            name,
+            arguments: ToolArguments::new(arguments),
+        }));
+    }
+    len
+}
+
 enum EchoReply {
     Text(String),
     ReadFile(String),
+    WriteFile { path: String, contents: String },
+}
+
+/// Which tool produced the result for `call_id`, from the assistant turn that
+/// requested it.
+fn tool_name<'a>(messages: &'a [Message], call_id: &ToolCallId) -> Option<&'a str> {
+    messages.iter().rev().find_map(|message| match message {
+        Message::Assistant { tool_calls, .. } => tool_calls
+            .iter()
+            .find(|call| call.id == *call_id)
+            .map(|call| call.name.as_str()),
+        Message::User(_) | Message::Tool { .. } => None,
+    })
+}
+
+/// Parses `write <path> <text>`: `write` must be the first word, and the text
+/// after the path is the file contents, with `\n` turned into line breaks.
+fn requested_write(text: &str) -> Option<(String, String)> {
+    let (command, rest) = text.split_once(char::is_whitespace)?;
+    if !command.eq_ignore_ascii_case("write") {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (path, contents) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let path = path.trim_matches(|c: char| matches!(c, '`' | '"' | '\''));
+    if path.is_empty() {
+        return None;
+    }
+    let mut contents = contents.trim().replace("\\n", "\n");
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    Some((path.to_owned(), contents))
+}
+
+fn write_result_reasoning(content: &str) -> String {
+    if content.starts_with("error:") {
+        "The write failed, so the file is unchanged. I'll pass the error on.".to_owned()
+    } else {
+        "The write went through. I'll confirm what changed.".to_owned()
+    }
+}
+
+fn summarize_write(content: &str) -> String {
+    if content.starts_with("error:") {
+        return format!("I couldn't write that file: {content}");
+    }
+    format!("Done: {content}.")
 }
 
 fn requested_path(text: &str) -> Option<String> {
@@ -308,6 +399,79 @@ mod tests {
             ModelChunk::Reasoning(_) | ModelChunk::Text(_) | ModelChunk::Usage(_) => None,
         });
         assert_eq!(call.unwrap().arguments.as_str(), r#"{"path":"Cargo.toml"}"#);
+    }
+
+    fn tool_call(chunks: &[ModelChunk]) -> &ToolCall {
+        chunks
+            .iter()
+            .find_map(|chunk| match chunk {
+                ModelChunk::ToolCall(call) => Some(call),
+                ModelChunk::Reasoning(_) | ModelChunk::Text(_) | ModelChunk::Usage(_) => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn echo_calls_write_file_when_asked_to_write() {
+        let chunks = collect(
+            &FakeProvider::echo(),
+            request(vec![Message::User(
+                UserText::parse("write `notes/todo.md` # Todo\\n- milk").unwrap(),
+            )]),
+        );
+        let call = tool_call(&chunks);
+        assert_eq!(call.name.as_str(), "write_file");
+        let args: serde_json::Value = serde_json::from_str(call.arguments.as_str()).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({ "path": "notes/todo.md", "contents": "# Todo\n- milk\n" })
+        );
+    }
+
+    #[test]
+    fn echo_does_not_write_unless_write_is_the_first_word() {
+        let chunks = collect(
+            &FakeProvider::echo(),
+            request(vec![Message::User(
+                UserText::parse("how do I write tests?").unwrap(),
+            )]),
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| !matches!(chunk, ModelChunk::ToolCall(_)))
+        );
+    }
+
+    #[test]
+    fn echo_summarizes_write_results_as_writes() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1").unwrap(),
+            name: ToolName::new("write_file").unwrap(),
+            arguments: ToolArguments::new("{}"),
+        };
+        let chunks = collect(
+            &FakeProvider::echo(),
+            request(vec![
+                Message::Assistant {
+                    reasoning: None,
+                    text: String::new(),
+                    tool_calls: vec![call],
+                },
+                Message::Tool {
+                    call_id: ToolCallId::new("call_1").unwrap(),
+                    content: "created `a.txt`: 3 bytes, 1 line".to_owned(),
+                },
+            ]),
+        );
+        let text: String = chunks
+            .iter()
+            .filter_map(|chunk| match chunk {
+                ModelChunk::Text(text) => Some(text.as_str()),
+                ModelChunk::Reasoning(_) | ModelChunk::ToolCall(_) | ModelChunk::Usage(_) => None,
+            })
+            .collect();
+        assert_eq!(text, "Done: created `a.txt`: 3 bytes, 1 line.");
     }
 
     #[test]
