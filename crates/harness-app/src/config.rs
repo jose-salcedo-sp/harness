@@ -9,7 +9,8 @@ use harness_core::{ContextWindow, ModelCatalog, ModelId, ModelInfo, model::opena
 pub(crate) const PROVIDER_VAR: &str = "HARNESS_PROVIDER";
 /// Overrides the model list: comma-separated `id=context_tokens` entries.
 pub(crate) const MODELS_VAR: &str = "HARNESS_MODELS";
-/// Directory the `read_file` tool may read. Defaults to the current directory.
+/// Directory the `read_file` and `write_file` tools are confined to. Defaults
+/// to the current directory.
 pub(crate) const WORKSPACE_VAR: &str = "HARNESS_WORKSPACE";
 /// Command-line flag that selects the fake provider.
 pub(crate) const FAKE_FLAG: &str = "--fake";

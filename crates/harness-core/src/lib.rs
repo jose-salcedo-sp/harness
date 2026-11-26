@@ -34,6 +34,6 @@ pub use model::{
     ModelInfo, ModelProvider, ModelRequest, ModelStream, TokenUsage,
 };
 pub use tool::{
-    FsTools, MemoryTools, ToolArguments, ToolCall, ToolCallId, ToolError, ToolExecutor, ToolName,
-    ToolOutput, ToolRequest, ToolSpec,
+    FileWrite, FsTools, MemoryTools, ToolArguments, ToolCall, ToolCallId, ToolError, ToolExecutor,
+    ToolName, ToolOutput, ToolRequest, ToolSpec, WriteKind,
 };

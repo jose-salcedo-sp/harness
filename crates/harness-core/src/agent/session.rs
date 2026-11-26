@@ -201,7 +201,7 @@ mod tests {
             ContextWindow, ModelChunk, ModelError, ModelId, ModelStream, TokenUsage,
             fake::{FakeProvider, FakeReply},
         },
-        tool::{MemoryTools, ToolArguments, ToolCall, ToolCallId, ToolName},
+        tool::{FileWrite, MemoryTools, ToolArguments, ToolCall, ToolCallId, ToolName, WriteKind},
     };
 
     fn model() -> ModelInfo {
@@ -350,6 +350,75 @@ mod tests {
                 "finished"
             ]
         );
+    }
+
+    #[test]
+    fn reads_then_rewrites_file_in_one_turn() {
+        let new_contents = "remember the milk\nand the eggs\n";
+        let write_call = ToolCall {
+            id: ToolCallId::new("c2").unwrap(),
+            name: ToolName::new("write_file").unwrap(),
+            arguments: ToolArguments::new(
+                serde_json::json!({ "path": "notes.txt", "contents": new_contents }).to_string(),
+            ),
+        };
+        let provider = Arc::new(FakeProvider::scripted([
+            FakeReply::new().tool_call(read_call("c1", "notes.txt")),
+            FakeReply::new().tool_call(write_call),
+            FakeReply::new().text("Added eggs."),
+        ]));
+        let tools = MemoryTools::new([("notes.txt", "remember the milk")]);
+        let session = Session::new(
+            AgentLoop::new(model()),
+            Arc::clone(&provider),
+            tools.clone(),
+        );
+        let mut events = Vec::new();
+        block_on(session.run(stream::iter([submit("add eggs")]), |event| {
+            events.push(event);
+        }));
+
+        assert_eq!(tools.file("notes.txt").as_deref(), Some(new_contents));
+        let write = events.iter().find_map(|e| {
+            if let AgentEvent::ToolCallFinished {
+                outcome: ToolOutcome::Succeeded { output },
+                ..
+            } = e
+            {
+                output.file_write().cloned()
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            write,
+            Some(FileWrite {
+                path: "notes.txt".into(),
+                kind: WriteKind::Overwritten,
+                bytes: 31,
+                lines: 2,
+            })
+        );
+        assert_eq!(reply_text(&events), "Added eggs.");
+        assert!(matches!(events.last(), Some(AgentEvent::TurnFinished)));
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[0]
+                .tools
+                .iter()
+                .any(|t| t.name.as_str() == "write_file")
+        );
+        assert!(matches!(
+            requests[1].messages.last(),
+            Some(Message::Tool { content, .. }) if content == "remember the milk"
+        ));
+        assert!(matches!(
+            requests[2].messages.last(),
+            Some(Message::Tool { content, .. })
+                if content == "overwrote `notes.txt`: 31 bytes, 2 lines"
+        ));
     }
 
     #[test]
