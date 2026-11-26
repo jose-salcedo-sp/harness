@@ -279,6 +279,79 @@ mod tests {
         ));
     }
 
+    /// The turn-shaping events, with deltas and context updates left out.
+    fn outline(events: &[AgentEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ReasoningDelta(_) => Some("think"),
+                AgentEvent::ReasoningFinished => Some("thought"),
+                AgentEvent::TextDelta(_) => Some("text"),
+                AgentEvent::ToolCallStarted(_) => Some("tool"),
+                AgentEvent::ToolCallFinished { .. } => Some("tool done"),
+                AgentEvent::TurnFinished => Some("finished"),
+                AgentEvent::UserMessage(_)
+                | AgentEvent::ContextUsage(_)
+                | AgentEvent::ModelChanged(_)
+                | AgentEvent::TurnFailed(_)
+                | AgentEvent::TurnCancelled
+                | AgentEvent::Rejected(_) => None,
+            })
+            .fold(Vec::new(), |mut outline, step| {
+                if outline.last() != Some(&step) {
+                    outline.push(step);
+                }
+                outline
+            })
+    }
+
+    #[test]
+    fn multi_round_turn_reads_think_tool_think_answer() {
+        let provider = FakeProvider::scripted([
+            FakeReply::new()
+                .reasoning("I should ")
+                .reasoning("read the notes.")
+                .tool_call(read_call("c1", "notes.txt")),
+            FakeReply::new()
+                .reasoning("They mention milk.")
+                .text("You need ")
+                .text("milk."),
+        ]);
+        let events = run(provider, vec![submit("what do I need?")]);
+        assert_eq!(
+            outline(&events),
+            [
+                "think",
+                "thought",
+                "tool",
+                "tool done",
+                "think",
+                "thought",
+                "text",
+                "finished"
+            ]
+        );
+        assert_eq!(reply_text(&events), "You need milk.");
+    }
+
+    #[test]
+    fn echo_provider_thinks_in_every_round() {
+        let events = run(FakeProvider::echo(), vec![submit("read notes.txt")]);
+        assert_eq!(
+            outline(&events),
+            [
+                "think",
+                "thought",
+                "tool",
+                "tool done",
+                "think",
+                "thought",
+                "text",
+                "finished"
+            ]
+        );
+    }
+
     #[test]
     fn missing_file_is_reported_to_model_not_user() {
         let provider = FakeProvider::scripted([

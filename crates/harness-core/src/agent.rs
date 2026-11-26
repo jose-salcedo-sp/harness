@@ -23,7 +23,7 @@ use std::{num::NonZeroU32, sync::Arc};
 pub use session::{Command, Session};
 
 use crate::{
-    conversation::{Message, SystemPrompt, UserText},
+    conversation::{Message, Reasoning, SystemPrompt, UserText, request_history},
     model::{
         ContextUsage, ModelChunk, ModelError, ModelInfo, ModelRequest, TokenUsage, estimate_tokens,
     },
@@ -53,9 +53,39 @@ pub enum Status {
 /// The model response being streamed.
 #[derive(Debug, Default)]
 struct Draft {
+    reasoning: String,
+    /// Whether the last content chunk was reasoning, so the next other chunk
+    /// (or the end of the response) closes the reasoning block.
+    thinking: bool,
     text: String,
     tool_calls: Vec<ToolCall>,
     usage: Option<TokenUsage>,
+}
+
+impl Draft {
+    /// Emits [`AgentEvent::ReasoningFinished`] if a reasoning block is open.
+    fn close_reasoning(&mut self, effects: &mut Vec<Effect>) {
+        if std::mem::take(&mut self.thinking) {
+            effects.push(Effect::Emit(AgentEvent::ReasoningFinished));
+        }
+    }
+
+    fn reasoning(&self) -> Option<Reasoning> {
+        // An empty trace just means the model did not think.
+        Reasoning::new(&self.reasoning).ok()
+    }
+
+    /// The assistant message for what was streamed, or `None` when the
+    /// response was empty.
+    fn into_message(self) -> Option<Message> {
+        let reasoning = self.reasoning();
+        let empty = reasoning.is_none() && self.text.is_empty() && self.tool_calls.is_empty();
+        (!empty).then_some(Message::Assistant {
+            reasoning,
+            text: self.text,
+            tool_calls: self.tool_calls,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -140,6 +170,13 @@ pub enum TurnFailure {
 pub enum AgentEvent {
     /// The user's message was accepted and a turn started.
     UserMessage(UserText),
+    /// The model streamed more of its thinking trace. The first delta after
+    /// any other event opens a new reasoning block.
+    ReasoningDelta(String),
+    /// The open reasoning block ended: the model started replying or calling
+    /// tools, or the response ended. Always follows a [`Self::ReasoningDelta`]
+    /// and precedes the events of whatever came next.
+    ReasoningFinished,
     /// The model streamed more reply text.
     TextDelta(String),
     /// A tool call is about to run.
@@ -324,19 +361,13 @@ impl AgentLoop {
                 self.finish_response(round, draft)
             }
             (Phase::Inferring { draft, .. }, Input::ModelFailed(error)) => {
-                self.keep_partial_reply(draft.text);
                 let failure = TurnFailure::Model(Arc::new(error));
-                (
-                    Phase::Idle,
-                    Ok(vec![Effect::Emit(AgentEvent::TurnFailed(failure))]),
-                )
+                let effects = self.keep_partial_reply(draft, AgentEvent::TurnFailed(failure));
+                (Phase::Idle, Ok(effects))
             }
             (Phase::Inferring { draft, .. }, Input::Cancel) => {
-                self.keep_partial_reply(draft.text);
-                (
-                    Phase::Idle,
-                    Ok(vec![Effect::Emit(AgentEvent::TurnCancelled)]),
-                )
+                let effects = self.keep_partial_reply(draft, AgentEvent::TurnCancelled);
+                (Phase::Idle, Ok(effects))
             }
             (Phase::RunningTools { round, pending }, Input::ToolFinished { id, result }) => {
                 self.tool_finished(round, pending, id, result)
@@ -356,13 +387,26 @@ impl AgentLoop {
 
     fn on_chunk(&mut self, draft: &mut Draft, chunk: ModelChunk) -> Vec<Effect> {
         match chunk {
+            ModelChunk::Reasoning(delta) => {
+                if !draft.thinking && !draft.reasoning.is_empty() {
+                    draft.reasoning.push_str("\n\n");
+                }
+                draft.thinking = true;
+                draft.reasoning.push_str(&delta);
+                vec![Effect::Emit(AgentEvent::ReasoningDelta(delta))]
+            }
             ModelChunk::Text(delta) => {
+                let mut effects = Vec::new();
+                draft.close_reasoning(&mut effects);
                 draft.text.push_str(&delta);
-                vec![Effect::Emit(AgentEvent::TextDelta(delta))]
+                effects.push(Effect::Emit(AgentEvent::TextDelta(delta)));
+                effects
             }
             ModelChunk::ToolCall(call) => {
+                let mut effects = Vec::new();
+                draft.close_reasoning(&mut effects);
                 draft.tool_calls.push(call);
-                Vec::new()
+                effects
             }
             ModelChunk::Usage(reported) => {
                 draft.usage = Some(reported);
@@ -399,18 +443,20 @@ impl AgentLoop {
         ModelRequest {
             model: self.model.id.clone(),
             system: self.system.clone(),
-            messages: self.messages.clone(),
+            messages: request_history(&self.messages),
             tools: self.tools.clone(),
         }
     }
 
-    fn keep_partial_reply(&mut self, text: String) {
-        if !text.is_empty() {
-            self.messages.push(Message::Assistant {
-                text,
-                tool_calls: Vec::new(),
-            });
-        }
+    /// Records what streamed before a failure or cancel, then emits `ending`.
+    /// Tool calls are dropped because they will never run.
+    fn keep_partial_reply(&mut self, mut draft: Draft, ending: AgentEvent) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        draft.close_reasoning(&mut effects);
+        draft.tool_calls.clear();
+        self.messages.extend(draft.into_message());
+        effects.push(Effect::Emit(ending));
+        effects
     }
 
     fn estimate_context(&self) -> u32 {
@@ -422,18 +468,17 @@ impl AgentLoop {
     fn finish_response(
         &mut self,
         round: NonZeroU32,
-        draft: Draft,
+        mut draft: Draft,
     ) -> (Phase, Result<Vec<Effect>, TransitionError>) {
-        let Draft {
-            text,
-            tool_calls,
-            usage,
-        } = draft;
-        self.messages.push(Message::Assistant {
-            text,
-            tool_calls: tool_calls.clone(),
-        });
         let mut effects = Vec::new();
+        draft.close_reasoning(&mut effects);
+        let usage = draft.usage;
+        let tool_calls = draft.tool_calls.clone();
+        self.messages.push(Message::Assistant {
+            reasoning: draft.reasoning(),
+            text: draft.text,
+            tool_calls: draft.tool_calls,
+        });
         if usage.is_none() {
             self.context_used = self.estimate_context();
             effects.push(Effect::Emit(AgentEvent::ContextUsage(self.context_usage())));
@@ -657,10 +702,177 @@ mod tests {
         assert_eq!(
             agent.messages().last(),
             Some(&Message::Assistant {
+                reasoning: None,
                 text: "Hello".to_owned(),
                 tool_calls: Vec::new()
             })
         );
+    }
+
+    fn reasoning_chunk(delta: &str) -> Input {
+        Input::ModelChunk(ModelChunk::Reasoning(delta.to_owned()))
+    }
+
+    fn events(effects: Vec<Effect>) -> Vec<AgentEvent> {
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Emit(event) => Some(event),
+                Effect::Infer(_) | Effect::RunTool(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reasoning_streams_then_closes_before_text() {
+        let mut agent = inferring_agent();
+        let mut seen = Vec::new();
+        for input in [
+            reasoning_chunk("Let me "),
+            reasoning_chunk("think."),
+            Input::ModelChunk(ModelChunk::Text("Hi".to_owned())),
+            Input::ModelFinished,
+        ] {
+            seen.extend(events(agent.handle(input).unwrap()));
+        }
+        assert!(matches!(
+            seen.as_slice(),
+            [
+                AgentEvent::ReasoningDelta(a),
+                AgentEvent::ReasoningDelta(b),
+                AgentEvent::ReasoningFinished,
+                AgentEvent::TextDelta(c),
+                AgentEvent::ContextUsage(_),
+                AgentEvent::TurnFinished,
+            ] if a == "Let me " && b == "think." && c == "Hi"
+        ));
+        assert_eq!(
+            agent.messages().last(),
+            Some(&Message::Assistant {
+                reasoning: Some(Reasoning::new("Let me think.").unwrap()),
+                text: "Hi".to_owned(),
+                tool_calls: Vec::new()
+            })
+        );
+    }
+
+    #[test]
+    fn reasoning_closes_before_tool_calls_start() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("need a file")).unwrap();
+        let on_call = events(
+            agent
+                .handle(Input::ModelChunk(ModelChunk::ToolCall(call("c1"))))
+                .unwrap(),
+        );
+        assert!(matches!(
+            on_call.as_slice(),
+            [AgentEvent::ReasoningFinished]
+        ));
+        let on_finish = events(agent.handle(Input::ModelFinished).unwrap());
+        assert!(
+            !on_finish
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ReasoningFinished))
+        );
+        assert!(matches!(
+            on_finish.last(),
+            Some(AgentEvent::ToolCallStarted(_))
+        ));
+    }
+
+    #[test]
+    fn reasoning_only_response_closes_when_it_ends() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("hmm")).unwrap();
+        let seen = events(agent.handle(Input::ModelFinished).unwrap());
+        assert!(matches!(seen.first(), Some(AgentEvent::ReasoningFinished)));
+        assert!(matches!(seen.last(), Some(AgentEvent::TurnFinished)));
+    }
+
+    #[test]
+    fn reasoning_resumed_after_text_is_a_new_block() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("one")).unwrap();
+        agent
+            .handle(Input::ModelChunk(ModelChunk::Text("a".to_owned())))
+            .unwrap();
+        agent.handle(reasoning_chunk("two")).unwrap();
+        let seen = events(agent.handle(Input::ModelFinished).unwrap());
+        assert!(matches!(seen.first(), Some(AgentEvent::ReasoningFinished)));
+        assert!(matches!(
+            agent.messages().last(),
+            Some(Message::Assistant { reasoning: Some(r), .. }) if r.as_str() == "one\n\ntwo"
+        ));
+    }
+
+    #[test]
+    fn cancel_while_thinking_closes_and_keeps_reasoning() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("halfway")).unwrap();
+        let seen = events(agent.handle(Input::Cancel).unwrap());
+        assert!(matches!(
+            seen.as_slice(),
+            [AgentEvent::ReasoningFinished, AgentEvent::TurnCancelled]
+        ));
+        assert!(matches!(
+            agent.messages().last(),
+            Some(Message::Assistant { reasoning: Some(r), text, .. })
+                if r.as_str() == "halfway" && text.is_empty()
+        ));
+    }
+
+    #[test]
+    fn failure_while_thinking_closes_reasoning_first() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("halfway")).unwrap();
+        let seen = events(
+            agent
+                .handle(Input::ModelFailed(ModelError::Status { status: 500 }))
+                .unwrap(),
+        );
+        assert!(matches!(
+            seen.as_slice(),
+            [AgentEvent::ReasoningFinished, AgentEvent::TurnFailed(_)]
+        ));
+    }
+
+    #[test]
+    fn reasoning_is_sent_back_within_the_turn_only() {
+        let mut agent = inferring_agent();
+        agent.handle(reasoning_chunk("plan")).unwrap();
+        agent
+            .handle(Input::ModelChunk(ModelChunk::ToolCall(call("c1"))))
+            .unwrap();
+        agent.handle(Input::ModelFinished).unwrap();
+        let effects = agent.handle(tool_ok("c1")).unwrap();
+        let Some(Effect::Infer(request)) = effects.last() else {
+            panic!("expected an Infer effect");
+        };
+        assert!(request.messages.iter().any(|m| matches!(
+            m,
+            Message::Assistant { reasoning: Some(r), .. } if r.as_str() == "plan"
+        )));
+
+        agent.handle(Input::ModelFinished).unwrap();
+        let effects = agent.handle(submit("next question")).unwrap();
+        let Some(Effect::Infer(request)) = effects.last() else {
+            panic!("expected an Infer effect");
+        };
+        assert!(!request.messages.iter().any(|m| matches!(
+            m,
+            Message::Assistant {
+                reasoning: Some(_),
+                ..
+            }
+        )));
+        assert!(agent.messages().iter().any(|m| matches!(
+            m,
+            Message::Assistant {
+                reasoning: Some(_),
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -856,6 +1068,24 @@ mod tests {
             agent
                 .handle(Input::ModelChunk(ModelChunk::Text("x".to_owned())))
                 .unwrap_err(),
+            TransitionError::NotInferring
+        );
+    }
+
+    #[test]
+    fn running_tools_rejects_reasoning() {
+        let mut agent = running_tools_agent(&["c1"]);
+        assert_eq!(
+            agent.handle(reasoning_chunk("late")).unwrap_err(),
+            TransitionError::NotInferring
+        );
+    }
+
+    #[test]
+    fn idle_rejects_reasoning() {
+        let mut agent = agent();
+        assert_eq!(
+            agent.handle(reasoning_chunk("x")).unwrap_err(),
             TransitionError::NotInferring
         );
     }

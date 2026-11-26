@@ -6,6 +6,7 @@
 
 pub mod fake;
 pub mod openai;
+mod think_tags;
 
 use std::{fmt, num::NonZeroU32, str::FromStr};
 
@@ -223,6 +224,8 @@ pub struct ModelRequest {
 /// One piece of a streamed model response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelChunk {
+    /// More of the model's thinking trace, kept apart from the reply text.
+    Reasoning(String),
     /// More reply text.
     Text(String),
     /// A complete tool call.

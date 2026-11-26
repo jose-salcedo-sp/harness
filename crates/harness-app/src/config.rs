@@ -3,10 +3,7 @@
 use std::{num::NonZeroU32, path::PathBuf};
 
 use anyhow::Context as _;
-use harness_core::{
-    ContextWindow, ModelCatalog, ModelId, ModelInfo,
-    model::openai::{self, OpenAiConfig},
-};
+use harness_core::{ContextWindow, ModelCatalog, ModelId, ModelInfo, model::openai::OpenAiConfig};
 
 /// Selects the model provider: `openai` (default) or `fake`.
 pub(crate) const PROVIDER_VAR: &str = "HARNESS_PROVIDER";
@@ -46,8 +43,7 @@ impl AppConfig {
             _ if fake_flag => ProviderChoice::Fake,
             Some("fake") => ProviderChoice::Fake,
             None | Some("" | "openai") => ProviderChoice::OpenAi(
-                OpenAiConfig::from_env(&lookup)
-                    .with_context(|| format!("invalid {}", openai::BASE_URL_VAR))?,
+                OpenAiConfig::from_env(&lookup).context("invalid model server settings")?,
             ),
             Some(other) => {
                 anyhow::bail!("{PROVIDER_VAR} must be `openai` or `fake`, not `{other}`")
@@ -140,6 +136,12 @@ mod tests {
     #[test]
     fn rejects_unknown_provider() {
         assert!(AppConfig::load([], env(&[(PROVIDER_VAR, "nope")])).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_reasoning_request() {
+        let error = AppConfig::load([], env(&[("HARNESS_REASONING", "maybe")])).unwrap_err();
+        assert!(format!("{error:#}").contains("HARNESS_REASONING"));
     }
 
     #[test]

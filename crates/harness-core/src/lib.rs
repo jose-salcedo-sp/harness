@@ -21,7 +21,7 @@ pub use agent::{
     AgentEvent, AgentLoop, Command, Effect, Input, Session, Status, ToolOutcome, TransitionError,
     TurnFailure,
 };
-pub use conversation::{EmptyMessage, Message, SystemPrompt, UserText};
+pub use conversation::{EmptyMessage, EmptyReasoning, Message, Reasoning, SystemPrompt, UserText};
 pub use model::{
     CatalogError, ContextUsage, ContextWindow, ModelCatalog, ModelChunk, ModelError, ModelId,
     ModelInfo, ModelProvider, ModelRequest, ModelStream, TokenUsage,

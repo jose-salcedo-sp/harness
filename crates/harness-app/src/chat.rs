@@ -1,20 +1,25 @@
 //! The chat window: header with model picker and context meter, the streamed
 //! transcript, and the message composer.
 
+use std::time::{Duration, Instant};
+
 use futures::{StreamExt as _, channel::mpsc};
 use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window,
+    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, WeakEntity, Window,
     component::{
         ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
         bubble::{Bubble, BubbleVariant},
         button::{Button, ButtonRounded, ButtonVariants as _},
+        collapsible::Collapsible,
         h_flex,
         input::{InputEvent, Textarea, TextareaState},
         message::{Message, MessageAlignment, MessageAvatar, MessageContent},
         message_scroller::{MessageScroller, MessageScrollerState},
         progress::Progress,
         select::{Select, SelectEvent, SelectItem, SelectState},
+        shimmer::ShimmerText,
         spinner::Spinner,
         text::TextView,
         v_flex,
@@ -66,9 +71,84 @@ struct ToolEntry {
     state: ToolState,
 }
 
+/// Whether a finished thinking block shows its trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disclosure {
+    Collapsed,
+    Expanded,
+}
+
+/// The lifecycle of one thinking block: open while the model streams its
+/// reasoning, then collapsed to a summary the user can expand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkingState {
+    Streaming {
+        started: Instant,
+    },
+    Done {
+        elapsed: Duration,
+        disclosure: Disclosure,
+    },
+}
+
+/// The reasoning of one model response.
+#[derive(Debug, Clone)]
+struct ThinkingEntry {
+    text: String,
+    state: ThinkingState,
+}
+
+impl ThinkingEntry {
+    fn new(delta: String, now: Instant) -> Self {
+        Self {
+            text: delta,
+            state: ThinkingState::Streaming { started: now },
+        }
+    }
+
+    fn is_streaming(&self) -> bool {
+        matches!(self.state, ThinkingState::Streaming { .. })
+    }
+
+    /// Appends streamed reasoning. A finished block ignores it.
+    fn push(&mut self, delta: &str) {
+        if self.is_streaming() {
+            self.text.push_str(delta);
+        }
+    }
+
+    /// Ends streaming and collapses the block. Finishing twice is a no-op.
+    fn finish(&mut self, now: Instant) {
+        if let ThinkingState::Streaming { started } = self.state {
+            self.state = ThinkingState::Done {
+                elapsed: now.saturating_duration_since(started),
+                disclosure: Disclosure::Collapsed,
+            };
+        }
+    }
+
+    /// Expands or collapses a finished block. A streaming block stays open.
+    fn toggle(&mut self) {
+        if let ThinkingState::Done { disclosure, .. } = &mut self.state {
+            *disclosure = match disclosure {
+                Disclosure::Collapsed => Disclosure::Expanded,
+                Disclosure::Expanded => Disclosure::Collapsed,
+            };
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        match self.state {
+            ThinkingState::Streaming { .. } => true,
+            ThinkingState::Done { disclosure, .. } => disclosure == Disclosure::Expanded,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Entry {
     User(SharedString),
+    Thinking(ThinkingEntry),
     Assistant(String),
     Tool(ToolEntry),
     Error(String),
@@ -247,6 +327,21 @@ impl ChatView {
                     .push(Entry::User(text.as_str().to_owned().into()));
                 self.turn = Turn::Thinking;
             }
+            AgentEvent::ReasoningDelta(delta) => {
+                if let Some(Entry::Thinking(thinking)) = self.entries.last_mut()
+                    && thinking.is_streaming()
+                {
+                    thinking.push(&delta);
+                } else {
+                    self.entries
+                        .push(Entry::Thinking(ThinkingEntry::new(delta, Instant::now())));
+                }
+            }
+            AgentEvent::ReasoningFinished => {
+                if let Some(thinking) = self.streaming_thinking() {
+                    thinking.finish(Instant::now());
+                }
+            }
             AgentEvent::TextDelta(delta) => {
                 if let Some(Entry::Assistant(text)) = self.entries.last_mut() {
                     text.push_str(&delta);
@@ -263,6 +358,7 @@ impl ChatView {
                     Entry::Tool(tool) if tool.id == id => Some(tool),
                     Entry::Tool(_)
                     | Entry::User(_)
+                    | Entry::Thinking(_)
                     | Entry::Assistant(_)
                     | Entry::Error(_)
                     | Entry::Notice(_) => None,
@@ -291,8 +387,37 @@ impl ChatView {
         cx.notify();
     }
 
+    fn streaming_thinking(&mut self) -> Option<&mut ThinkingEntry> {
+        match self.entries.last_mut() {
+            Some(Entry::Thinking(thinking)) if thinking.is_streaming() => Some(thinking),
+            Some(
+                Entry::Thinking(_)
+                | Entry::User(_)
+                | Entry::Assistant(_)
+                | Entry::Tool(_)
+                | Entry::Error(_)
+                | Entry::Notice(_),
+            )
+            | None => None,
+        }
+    }
+
+    fn toggle_thinking(&mut self, ix: usize, cx: &mut Context<'_, Self>) {
+        if let Some(Entry::Thinking(thinking)) = self.entries.get_mut(ix) {
+            thinking.toggle();
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.remeasure_items(ix..ix + 1, cx);
+            });
+            cx.notify();
+        }
+    }
+
+    /// Whether the "Thinking…" placeholder row is shown: the model is busy but
+    /// nothing it is streaming is visible yet.
     fn shows_typing(&self) -> bool {
-        self.turn != Turn::Idle && !matches!(self.entries.last(), Some(Entry::Assistant(_)))
+        self.turn != Turn::Idle
+            && !matches!(self.entries.last(), Some(Entry::Assistant(_)))
+            && !matches!(self.entries.last(), Some(Entry::Thinking(t)) if t.is_streaming())
     }
 
     fn row_count(&self) -> usize {
@@ -313,13 +438,14 @@ impl ChatView {
         });
     }
 
-    fn render_row(&self, ix: usize, cx: &App) -> gpui_kit::AnyElement {
+    fn render_row(&self, ix: usize, view: &WeakEntity<Self>, cx: &App) -> gpui_kit::AnyElement {
         match self.entries.get(ix) {
             Some(Entry::User(text)) => Message::new()
                 .id(("user", ix))
                 .alignment(MessageAlignment::End)
                 .content(MessageContent::new().bubble(Bubble::new().child(text.clone())))
                 .into_any_element(),
+            Some(Entry::Thinking(thinking)) => render_thinking(ix, thinking, view.clone(), cx),
             Some(Entry::Assistant(text)) => Message::new()
                 .id(("assistant", ix))
                 .avatar_slot(MessageAvatar::new().child(bot_avatar(cx)))
@@ -543,7 +669,7 @@ impl Render for ChatView {
             MessageScroller::new("transcript", self.scroller.clone(), move |ix, _, cx| {
                 view.upgrade().map_or_else(
                     || div().into_any_element(),
-                    |view| view.read(cx).render_row(ix, cx),
+                    |entity| entity.read(cx).render_row(ix, &view, cx),
                 )
             })
             .size_full()
@@ -647,6 +773,75 @@ fn render_tool(ix: usize, tool: &ToolEntry, cx: &App) -> gpui_kit::AnyElement {
         .into_any_element()
 }
 
+fn render_thinking(
+    ix: usize,
+    thinking: &ThinkingEntry,
+    view: WeakEntity<ChatView>,
+    cx: &App,
+) -> gpui_kit::AnyElement {
+    let theme = cx.theme();
+    let open = thinking.is_open();
+    let label = match thinking.state {
+        ThinkingState::Streaming { .. } => ShimmerText::new("Thinking…")
+            .id(("thinking-shimmer", ix))
+            .into_any_element(),
+        ThinkingState::Done { elapsed, .. } => thought_summary(elapsed).into_any_element(),
+    };
+    let header = h_flex()
+        .id(("thinking-toggle", ix))
+        .gap_1p5()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .cursor_pointer()
+        .hover(|style| style.text_color(theme.foreground))
+        .child(
+            Icon::new(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+            .xsmall(),
+        )
+        .child(label)
+        .on_click(move |_, _, cx| {
+            // A dropped view has no block left to toggle.
+            let _ = view.update(cx, |view, cx| view.toggle_thinking(ix, cx));
+        });
+    let trace = div()
+        .mt_1()
+        .ml(px(5.))
+        .pl_3()
+        .border_l_2()
+        .border_color(theme.border)
+        .text_xs()
+        .line_height(px(18.))
+        .text_color(theme.muted_foreground)
+        .child(thinking.text.trim().to_owned());
+    h_flex()
+        .id(("thinking", ix))
+        .w_full()
+        .pl(px(40.))
+        .pr_5()
+        .child(
+            Collapsible::new()
+                .open(open)
+                .w_full()
+                .child(header)
+                .content(trace),
+        )
+        .into_any_element()
+}
+
+/// The collapsed label of a finished thinking block, such as `Thought for 4s`.
+fn thought_summary(elapsed: Duration) -> String {
+    let seconds = (elapsed.as_millis() + 500) / 1_000;
+    match seconds {
+        0 => "Thought for <1s".to_owned(),
+        1..60 => format!("Thought for {seconds}s"),
+        _ => format!("Thought for {}m {}s", seconds / 60, seconds % 60),
+    }
+}
+
 fn tool_entry(call: &ToolCall) -> ToolEntry {
     let target = match ToolRequest::parse(call) {
         Ok(ToolRequest::ReadFile { path }) => Some(path.display().to_string()),
@@ -728,6 +923,67 @@ mod tests {
         assert_eq!(compact_tokens(1_250), "1.2k");
         assert_eq!(compact_tokens(2_048), "2.0k");
         assert_eq!(compact_tokens(32_768), "32k");
+    }
+
+    #[test]
+    fn summarizes_thinking_time() {
+        assert_eq!(
+            thought_summary(Duration::from_millis(300)),
+            "Thought for <1s"
+        );
+        assert_eq!(
+            thought_summary(Duration::from_millis(2_600)),
+            "Thought for 3s"
+        );
+        assert_eq!(
+            thought_summary(Duration::from_secs(75)),
+            "Thought for 1m 15s"
+        );
+    }
+
+    #[test]
+    fn thinking_streams_open_then_collapses_with_elapsed_time() {
+        let start = Instant::now();
+        let mut thinking = ThinkingEntry::new("Let me ".to_owned(), start);
+        thinking.push("think.");
+        assert!(thinking.is_open());
+        thinking.finish(start + Duration::from_secs(4));
+        assert_eq!(thinking.text, "Let me think.");
+        assert!(!thinking.is_open());
+        assert_eq!(
+            thinking.state,
+            ThinkingState::Done {
+                elapsed: Duration::from_secs(4),
+                disclosure: Disclosure::Collapsed
+            }
+        );
+    }
+
+    #[test]
+    fn finished_thinking_toggles_and_ignores_late_events() {
+        let start = Instant::now();
+        let mut thinking = ThinkingEntry::new("plan".to_owned(), start);
+        thinking.finish(start + Duration::from_secs(1));
+        thinking.toggle();
+        assert!(thinking.is_open());
+        thinking.toggle();
+        assert!(!thinking.is_open());
+
+        thinking.push(" more");
+        thinking.finish(start + Duration::from_secs(9));
+        assert_eq!(thinking.text, "plan");
+        assert!(matches!(
+            thinking.state,
+            ThinkingState::Done { elapsed, .. } if elapsed == Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn streaming_thinking_cannot_be_collapsed() {
+        let mut thinking = ThinkingEntry::new("plan".to_owned(), Instant::now());
+        thinking.toggle();
+        assert!(thinking.is_open());
+        assert!(thinking.is_streaming());
     }
 
     #[test]

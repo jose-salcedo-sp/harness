@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 
 use crate::{
-    model::{ModelChunk, ModelError, TokenUsage},
+    model::{ModelChunk, ModelError, TokenUsage, think_tags::ThinkTagSplitter},
     tool::{ToolArguments, ToolCall, ToolCallId, ToolName},
 };
 
@@ -24,6 +24,9 @@ struct Choice {
 
 #[derive(Deserialize, Default)]
 struct Delta {
+    /// Thoughts the server parsed out of the output (`llama-server` with
+    /// `reasoning_format: deepseek`, and DeepSeek-compatible APIs).
+    reasoning_content: Option<String>,
     content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCallDelta>,
@@ -57,11 +60,14 @@ struct PartialCall {
 
 /// Turns `data:` lines into [`ModelChunk`]s.
 ///
-/// Text is emitted as soon as it arrives. Tool calls arrive in fragments, so
-/// they are assembled and emitted by [`SseDecoder::finish`].
+/// Text and reasoning are emitted as soon as they arrive; reasoning comes from
+/// `reasoning_content` deltas or, as a fallback, from `<think>` tags inside the
+/// content. Tool calls arrive in fragments, so they are assembled and emitted
+/// by [`SseDecoder::finish`].
 #[derive(Default)]
 pub(super) struct SseDecoder {
     calls: BTreeMap<u64, PartialCall>,
+    content: ThinkTagSplitter,
     done: bool,
 }
 
@@ -83,8 +89,11 @@ impl SseDecoder {
         let event: StreamEvent = serde_json::from_str(data).map_err(ModelError::Decode)?;
         let mut chunks = Vec::new();
         for delta in event.choices.into_iter().map(|choice| choice.delta) {
-            if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
-                chunks.push(ModelChunk::Text(text));
+            if let Some(reasoning) = delta.reasoning_content.filter(|text| !text.is_empty()) {
+                chunks.push(ModelChunk::Reasoning(reasoning));
+            }
+            if let Some(text) = delta.content {
+                chunks.extend(self.content.push(&text));
             }
             for fragment in delta.tool_calls {
                 let call = self.calls.entry(fragment.index).or_default();
@@ -108,23 +117,23 @@ impl SseDecoder {
         Ok(chunks)
     }
 
-    /// Emits the assembled tool calls once the stream has ended.
+    /// Emits held-back content and the assembled tool calls once the stream
+    /// has ended.
     pub(super) fn finish(self) -> Result<Vec<ModelChunk>, ModelError> {
-        self.calls
-            .into_iter()
-            .map(|(index, call)| {
-                let incomplete = |_| ModelError::IncompleteToolCall { index };
-                Ok(ModelChunk::ToolCall(ToolCall {
-                    id: ToolCallId::new(call.id).map_err(incomplete)?,
-                    name: ToolName::new(call.name).map_err(incomplete)?,
-                    arguments: ToolArguments::new(if call.arguments.is_empty() {
-                        "{}".to_owned()
-                    } else {
-                        call.arguments
-                    }),
-                }))
-            })
-            .collect()
+        let held = self.content.finish().map(Ok);
+        let calls = self.calls.into_iter().map(|(index, call)| {
+            let incomplete = |_| ModelError::IncompleteToolCall { index };
+            Ok(ModelChunk::ToolCall(ToolCall {
+                id: ToolCallId::new(call.id).map_err(incomplete)?,
+                name: ToolName::new(call.name).map_err(incomplete)?,
+                arguments: ToolArguments::new(if call.arguments.is_empty() {
+                    "{}".to_owned()
+                } else {
+                    call.arguments
+                }),
+            }))
+        });
+        held.into_iter().chain(calls).collect()
     }
 }
 
@@ -158,6 +167,55 @@ mod tests {
                 ModelChunk::Text("lo".to_owned())
             ]
         );
+    }
+
+    #[test]
+    fn decodes_reasoning_content_apart_from_text() {
+        let chunks = decode(&[
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":null,"reasoning_content":"Let me"}}]}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":" think."}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"Done."}}]}"#,
+        ])
+        .unwrap();
+        assert_eq!(
+            chunks,
+            [
+                ModelChunk::Reasoning("Let me".to_owned()),
+                ModelChunk::Reasoning(" think.".to_owned()),
+                ModelChunk::Text("Done.".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_think_tags_split_across_events() {
+        let chunks = decode(&[
+            r#"data: {"choices":[{"delta":{"content":"<thi"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"nk>plan</th"}}]}"#,
+            r#"data: {"choices":[{"delta":{"content":"ink>Hi"}}]}"#,
+            "data: [DONE]",
+        ])
+        .unwrap();
+        assert_eq!(
+            chunks,
+            [
+                ModelChunk::Reasoning("plan".to_owned()),
+                ModelChunk::Text("Hi".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn flushes_held_content_before_tool_calls() {
+        let chunks = decode(&[
+            r#"data: {"choices":[{"delta":{"content":"a <"}}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"read_file"}}]}}]}"#,
+        ])
+        .unwrap();
+        assert!(matches!(
+            chunks.as_slice(),
+            [ModelChunk::Text(a), ModelChunk::Text(b), ModelChunk::ToolCall(_)] if a == "a " && b == "<"
+        ));
     }
 
     #[test]
