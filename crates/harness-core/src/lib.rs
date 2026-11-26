@@ -11,9 +11,12 @@
 //!   [`model::fake`] adapters.
 //! - [`tool`]: the [`ToolExecutor`] port, with [`FsTools`] and [`MemoryTools`].
 //! - [`conversation`]: messages exchanged with the model.
+//! - [`files`]: the [`FileIndex`] port, with [`WorkspaceFiles`] and
+//!   [`MemoryFileIndex`], plus `@` mention parsing and fuzzy path matching.
 
 pub mod agent;
 pub mod conversation;
+pub mod files;
 pub mod model;
 pub mod tool;
 
@@ -22,6 +25,10 @@ pub use agent::{
     TurnFailure,
 };
 pub use conversation::{EmptyMessage, EmptyReasoning, Message, Reasoning, SystemPrompt, UserText};
+pub use files::{
+    FileIndex, FileIndexError, FileMatch, FileMention, MemoryFileIndex, MentionEdit,
+    WorkspaceFiles, WorkspacePath, match_files,
+};
 pub use model::{
     CatalogError, ContextUsage, ContextWindow, ModelCatalog, ModelChunk, ModelError, ModelId,
     ModelInfo, ModelProvider, ModelRequest, ModelStream, TokenUsage,

@@ -1,20 +1,27 @@
 //! The chat window: header with model picker and context meter, the streamed
-//! transcript, and the message composer.
+//! transcript, and the message composer with its `@` file-mention popup.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use futures::{StreamExt as _, channel::mpsc};
 use gpui_kit::{
-    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, WeakEntity, Window,
+    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, HighlightStyle,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, StyledText, Subscription, Task, WeakEntity,
+    Window,
     component::{
-        ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _,
+        ActiveTheme as _, Icon, IconName, IndexPath, Sizable as _, ThemeStyled as _,
         bubble::{Bubble, BubbleVariant},
         button::{Button, ButtonRounded, ButtonVariants as _},
         collapsible::Collapsible,
         h_flex,
-        input::{InputEvent, Textarea, TextareaState},
+        input::{
+            Enter, Escape, IndentInline, InputEvent, MoveDown, MoveUp, Textarea, TextareaState,
+        },
+        list::ListItem,
         message::{Message, MessageAlignment, MessageAvatar, MessageContent},
         message_scroller::{MessageScroller, MessageScrollerState},
         progress::Progress,
@@ -29,9 +36,15 @@ use gpui_kit::{
     px,
 };
 use harness_core::{
-    AgentEvent, AgentLoop, Command, ContextUsage, FsTools, ModelCatalog, ModelId, ModelInfo,
-    ModelProvider, Session, ToolCall, ToolCallId, ToolOutcome, ToolRequest, TurnFailure, UserText,
+    AgentEvent, AgentLoop, Command, ContextUsage, FileIndex, FileMatch, FileMention, FsTools,
+    ModelCatalog, ModelId, ModelInfo, ModelProvider, Session, ToolCall, ToolCallId, ToolOutcome,
+    ToolRequest, TurnFailure, UserText, WorkspacePath, match_files,
 };
+
+use crate::file_popup::{FilePopup, Step, Transition};
+
+/// Most rows the file popup shows.
+const FILE_ROWS: usize = 8;
 
 const SUGGESTIONS: [&str; 3] = [
     "read Cargo.toml",
@@ -44,6 +57,8 @@ pub(crate) struct Launch {
     pub(crate) catalog: ModelCatalog,
     pub(crate) provider: Box<dyn ModelProvider>,
     pub(crate) tools: FsTools,
+    /// Lists the files `@` mentions offer; should share `tools`' root.
+    pub(crate) files: Box<dyn FileIndex>,
     pub(crate) provider_label: String,
 }
 
@@ -155,6 +170,34 @@ enum Entry {
     Notice(SharedString),
 }
 
+/// The workspace file list the popup searches.
+#[derive(Debug, Clone)]
+enum FileList {
+    Unloaded,
+    /// A listing is running; `stale` is the previous one, if any, which is
+    /// searched in the meantime.
+    Loading {
+        stale: Option<Arc<[WorkspacePath]>>,
+    },
+    Ready(Arc<[WorkspacePath]>),
+    Failed(SharedString),
+}
+
+impl FileList {
+    fn paths(&self) -> Option<&Arc<[WorkspacePath]>> {
+        match self {
+            Self::Loading { stale } => stale.as_ref(),
+            Self::Ready(paths) => Some(paths),
+            Self::Unloaded | Self::Failed(_) => None,
+        }
+    }
+
+    fn start_loading(&mut self) {
+        let stale = self.paths().cloned();
+        *self = Self::Loading { stale };
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ModelOption(ModelInfo);
 
@@ -199,6 +242,12 @@ pub(crate) struct ChatView {
     model_select: Entity<SelectState<Vec<ModelOption>>>,
     scroller: Entity<MessageScrollerState>,
     commands: mpsc::UnboundedSender<Command>,
+    file_index: Box<dyn FileIndex>,
+    files: FileList,
+    file_popup: FilePopup,
+    /// Dropping a task cancels it, so replacing these abandons stale work.
+    file_listing: Task<()>,
+    file_search: Task<()>,
     _subscriptions: Vec<Subscription>,
     _session: Task<()>,
     _events: Task<()>,
@@ -210,6 +259,7 @@ impl ChatView {
             catalog,
             provider,
             tools,
+            files,
             provider_label,
         } = launch;
 
@@ -254,6 +304,9 @@ impl ChatView {
                     this.submit(window, cx);
                 }
             }),
+            // Observing, not subscribing: moving the cursor emits no event
+            // but can enter or leave an `@` token.
+            cx.observe(&input, |this, _, cx| this.follow_mention(cx)),
             cx.subscribe_in(
                 &model_select,
                 window,
@@ -277,6 +330,11 @@ impl ChatView {
             model_select,
             scroller,
             commands,
+            file_index: files,
+            files: FileList::Unloaded,
+            file_popup: FilePopup::Closed,
+            file_listing: Task::ready(()),
+            file_search: Task::ready(()),
             _subscriptions: subscriptions,
             _session: session_task,
             _events: events_task,
@@ -307,6 +365,125 @@ impl ChatView {
         self.input
             .update(cx, |state, cx| state.set_value(text.to_owned(), window, cx));
         self.submit(window, cx);
+    }
+
+    /// Opens, updates, or closes the file popup to match the `@` token
+    /// under the cursor.
+    fn follow_mention(&mut self, cx: &mut Context<'_, Self>) {
+        let mention = {
+            let input = self.input.read(cx);
+            FileMention::at_cursor(&input.value(), input.cursor())
+        };
+        match self.file_popup.on_mention(mention) {
+            Transition::Unchanged => return,
+            Transition::Opened => {
+                self.list_files(cx);
+                self.search_files(cx);
+            }
+            Transition::Requeried => self.search_files(cx),
+            Transition::Closed => self.file_search = Task::ready(()),
+        }
+        cx.notify();
+    }
+
+    /// Re-lists the workspace in the background, so files created since the
+    /// last mention show up.
+    fn list_files(&mut self, cx: &mut Context<'_, Self>) {
+        if matches!(self.files, FileList::Loading { .. }) {
+            return;
+        }
+        self.files.start_loading();
+        let listing = self.file_index.files();
+        self.file_listing = cx.spawn(async move |this, cx| {
+            let result = cx.background_executor().spawn(listing).await;
+            // An error means the view is gone, and nobody needs the files.
+            let _ = this.update(cx, |view, cx| {
+                view.files = match result {
+                    Ok(paths) => FileList::Ready(paths.into()),
+                    Err(error) => FileList::Failed(error_chain(&error).into()),
+                };
+                view.search_files(cx);
+                cx.notify();
+            });
+        });
+    }
+
+    /// Ranks the file list against the popup's query in the background.
+    fn search_files(&mut self, cx: &mut Context<'_, Self>) {
+        let (Some(query), Some(paths)) = (self.file_popup.query(), self.files.paths()) else {
+            return;
+        };
+        let query = query.to_owned();
+        let paths = Arc::clone(paths);
+        self.file_search = cx.spawn(async move |this, cx| {
+            let ranking = {
+                let query = query.clone();
+                cx.background_executor()
+                    .spawn(async move { match_files(&paths, &query, FILE_ROWS) })
+            };
+            let found = ranking.await;
+            // An error means the view is gone, and nobody needs the matches.
+            let _ = this.update(cx, |view, cx| {
+                if view.file_popup.on_matches(&query, found) {
+                    cx.notify();
+                }
+            });
+        });
+    }
+
+    /// Replaces the `@` token with the file at row `ix`, or the highlighted
+    /// row.
+    fn accept_file(&mut self, ix: Option<usize>, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let Some(edit) = self.file_popup.accept(ix) else {
+            return;
+        };
+        self.file_search = Task::ready(());
+        self.input.update(cx, |state, cx| {
+            state.set_selected_range(edit.range, cx);
+            state.replace(edit.text, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    fn on_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.step_file(Step::Up, cx);
+    }
+
+    fn on_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<'_, Self>) {
+        self.step_file(Step::Down, cx);
+    }
+
+    fn step_file(&mut self, step: Step, cx: &mut Context<'_, Self>) {
+        if self.file_popup.step(step) {
+            cx.stop_propagation();
+            cx.notify();
+        }
+    }
+
+    fn on_enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !action.shift && !action.secondary {
+            self.accept_highlighted(window, cx);
+        }
+    }
+
+    fn on_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.accept_highlighted(window, cx);
+    }
+
+    fn accept_highlighted(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.file_popup.has_matches() {
+            cx.stop_propagation();
+            self.accept_file(None, window, cx);
+        }
+    }
+
+    fn on_escape(&mut self, _: &Escape, _: &mut Window, cx: &mut Context<'_, Self>) {
+        if self.file_popup.dismiss() {
+            cx.stop_propagation();
+            self.file_search = Task::ready(());
+            cx.notify();
+        }
     }
 
     fn cancel(&mut self, _: &ClickEvent, _: &mut Window, _: &mut Context<'_, Self>) {
@@ -632,8 +809,14 @@ impl ChatView {
                 .tooltip("Send")
                 .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx)))
         };
+        let hint = if self.file_popup.is_open() {
+            "↑↓ to choose · Enter or Tab to insert · Esc to dismiss"
+        } else {
+            "Enter to send · Shift+Enter for a new line · @ to mention a file"
+        };
         div().w_full().px_5().pb_5().pt_2().child(
             v_flex()
+                .relative()
                 .w_full()
                 .max_w(px(820.))
                 .mx_auto()
@@ -644,6 +827,14 @@ impl ChatView {
                 .border_color(theme.border)
                 .bg(theme.secondary)
                 .shadow_md()
+                // Capture runs before the textarea's own handlers, so these
+                // can claim the keys while the popup is open; each one lets
+                // the key through when there is nothing to act on.
+                .capture_action(cx.listener(Self::on_move_up))
+                .capture_action(cx.listener(Self::on_move_down))
+                .capture_action(cx.listener(Self::on_enter))
+                .capture_action(cx.listener(Self::on_tab))
+                .capture_action(cx.listener(Self::on_escape))
                 .child(Textarea::new(&self.input).appearance(false))
                 .child(
                     h_flex()
@@ -652,11 +843,94 @@ impl ChatView {
                             div()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("Enter to send · Shift+Enter for a new line"),
+                                .child(hint),
                         )
                         .child(action),
+                )
+                .children(self.render_file_popup(cx)),
+        )
+    }
+
+    fn render_file_popup(&self, cx: &mut Context<'_, Self>) -> Option<impl IntoElement> {
+        let FilePopup::Open {
+            mention,
+            matches,
+            selected,
+        } = &self.file_popup
+        else {
+            return None;
+        };
+        let rows = if matches.is_empty() {
+            vec![self.render_file_status(mention.query(), cx)]
+        } else {
+            matches
+                .iter()
+                .enumerate()
+                .map(|(ix, found)| render_file_row(ix, found, ix == *selected, cx))
+                .collect()
+        };
+        let muted = cx.theme().muted_foreground;
+        Some(
+            div()
+                .absolute()
+                .bottom_full()
+                .left_0()
+                .right_0()
+                .mb_2()
+                .child(
+                    v_flex()
+                        .id("file-popup")
+                        .occlude()
+                        .popover_style(cx)
+                        .p_1()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(muted)
+                                .child("Workspace files"),
+                        )
+                        .children(rows),
                 ),
         )
+    }
+
+    /// The row shown in place of matches: still listing, failed, or empty.
+    fn render_file_status(&self, query: &str, cx: &App) -> gpui_kit::AnyElement {
+        let theme = cx.theme();
+        let (icon, text): (gpui_kit::AnyElement, SharedString) = match &self.files {
+            FileList::Unloaded | FileList::Loading { stale: None } => (
+                Spinner::new().xsmall().into_any_element(),
+                "Indexing workspace…".into(),
+            ),
+            FileList::Failed(message) => (
+                Icon::new(IconName::CircleAlert)
+                    .xsmall()
+                    .text_color(theme.danger)
+                    .into_any_element(),
+                message.clone(),
+            ),
+            FileList::Loading { stale: Some(_) } | FileList::Ready(_) => (
+                Icon::new(IconName::File).xsmall().into_any_element(),
+                if query.is_empty() {
+                    "No files in the workspace".into()
+                } else {
+                    format!("No files match “{query}”").into()
+                },
+            ),
+        };
+        h_flex()
+            .gap_2()
+            .px_2()
+            .py_1p5()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .child(icon)
+            .child(text)
+            .into_any_element()
     }
 }
 
@@ -828,6 +1102,53 @@ fn render_thinking(
                 .w_full()
                 .child(header)
                 .content(trace),
+        )
+        .into_any_element()
+}
+
+fn render_file_row(
+    ix: usize,
+    found: &FileMatch,
+    selected: bool,
+    cx: &mut Context<'_, ChatView>,
+) -> gpui_kit::AnyElement {
+    let theme = cx.theme();
+    let path = found.path().as_str();
+    let highlight = HighlightStyle {
+        color: Some(theme.blue),
+        font_weight: Some(FontWeight::SEMIBOLD),
+        ..HighlightStyle::default()
+    };
+    let highlights = found
+        .highlights()
+        .iter()
+        .map(|range| (range.clone(), highlight));
+    ListItem::new(("file", ix))
+        .selected(selected)
+        .accessibility_label(path.to_owned())
+        .px_2()
+        .py_1()
+        .rounded(theme.radius)
+        .text_sm()
+        .on_click(cx.listener(move |this, _, window, cx| this.accept_file(Some(ix), window, cx)))
+        .on_mouse_enter(cx.listener(move |this, _, _, cx| {
+            if this.file_popup.hover(ix) {
+                cx.notify();
+            }
+        }))
+        .child(
+            h_flex()
+                .gap_2()
+                .child(
+                    Icon::new(IconName::File)
+                        .xsmall()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .font_family(theme.mono_font_family.clone())
+                        .child(StyledText::new(path.to_owned()).with_highlights(highlights)),
+                ),
         )
         .into_any_element()
 }
