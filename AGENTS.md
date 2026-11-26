@@ -69,9 +69,11 @@ cargo run -p harness-app
 | `HARNESS_REASONING` | `llama-cpp` | `none` stops sending llama.cpp's reasoning request fields, for hosted APIs that reject unknown fields. |
 
 To run without a model server, use the deterministic fake provider. It echoes
-messages, and a message containing `read <path>` makes it call the `read_file` tool.
-Each response starts with a scripted thinking trace and streams at about a local
-model's pace, so thinking blocks can be watched offline:
+messages, a message containing `read <path>` makes it call the `read_file` tool, and
+a message starting with `write <path> <text>` makes it call `write_file` with `<text>`
+as the contents (`\n` becomes a line break). Each response starts with a scripted
+thinking trace and streams at about a local model's pace, so thinking blocks can be
+watched offline:
 
 ```sh
 cargo run -p harness-app -- --fake
