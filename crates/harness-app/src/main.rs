@@ -5,6 +5,7 @@
 
 mod chat;
 mod config;
+mod file_popup;
 
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use gpui_kit::{
     px, size,
 };
 use harness_core::{
-    FsTools, ModelProvider,
+    FsTools, ModelProvider, WorkspaceFiles,
     model::{fake::FakeProvider, openai::OpenAiProvider},
 };
 
@@ -52,6 +53,7 @@ fn launch(config: AppConfig) -> anyhow::Result<Launch> {
         None => std::env::current_dir().context("could not read the current directory")?,
     };
     let tools = FsTools::new(&workspace)?;
+    let files = Box::new(WorkspaceFiles::new(&tools));
     let provider: Box<dyn ModelProvider> = match config.provider {
         ProviderChoice::Fake => Box::new(FakeProvider::echo().chunk_delay(FAKE_CHUNK_DELAY)),
         ProviderChoice::OpenAi(openai) => Box::new(OpenAiProvider::new(openai)),
@@ -60,6 +62,7 @@ fn launch(config: AppConfig) -> anyhow::Result<Launch> {
         catalog: config.catalog,
         provider,
         tools,
+        files,
         provider_label,
     })
 }

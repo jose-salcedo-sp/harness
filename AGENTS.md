@@ -64,7 +64,7 @@ cargo run -p harness-app
 | `HARNESS_BASE_URL` | `http://127.0.0.1:8080/v1` | Server base URL. |
 | `HARNESS_API_KEY` | unset | Sent as `Authorization: Bearer …`; a local server needs none. |
 | `HARNESS_MODELS` | Bonsai 2 9B/4B/2B at 32k | Model picker entries, `id=context_tokens,…`; the first is selected. |
-| `HARNESS_WORKSPACE` | current directory | The only directory the `read_file` tool may read. |
+| `HARNESS_WORKSPACE` | current directory | The only directory the `read_file` tool may read, and the files `@` mentions offer. |
 | `HARNESS_PROVIDER` | `openai` | `fake` selects the offline provider (same as `--fake`). |
 | `HARNESS_REASONING` | `llama-cpp` | `none` stops sending llama.cpp's reasoning request fields, for hosted APIs that reject unknown fields. |
 
