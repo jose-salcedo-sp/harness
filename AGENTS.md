@@ -66,9 +66,12 @@ cargo run -p harness-app
 | `HARNESS_MODELS` | Bonsai 2 9B/4B/2B at 32k | Model picker entries, `id=context_tokens,…`; the first is selected. |
 | `HARNESS_WORKSPACE` | current directory | The only directory the `read_file` tool may read. |
 | `HARNESS_PROVIDER` | `openai` | `fake` selects the offline provider (same as `--fake`). |
+| `HARNESS_REASONING` | `llama-cpp` | `none` stops sending llama.cpp's reasoning request fields, for hosted APIs that reject unknown fields. |
 
 To run without a model server, use the deterministic fake provider. It echoes
-messages, and a message containing `read <path>` makes it call the `read_file` tool:
+messages, and a message containing `read <path>` makes it call the `read_file` tool.
+Each response starts with a scripted thinking trace and streams at about a local
+model's pace, so thinking blocks can be watched offline:
 
 ```sh
 cargo run -p harness-app -- --fake

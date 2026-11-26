@@ -6,6 +6,8 @@
 mod chat;
 mod config;
 
+use std::time::Duration;
+
 use anyhow::Context as _;
 use gpui_kit::{
     App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
@@ -21,6 +23,10 @@ use crate::{
     chat::{ChatView, Launch},
     config::{AppConfig, ProviderChoice},
 };
+
+/// Pause between fake-provider chunks, about a local model's token rate, so
+/// streaming thinking and replies can be watched offline.
+const FAKE_CHUNK_DELAY: Duration = Duration::from_millis(45);
 
 fn main() -> anyhow::Result<()> {
     let config = AppConfig::load(std::env::args().skip(1), |name| std::env::var(name).ok())?;
@@ -47,7 +53,7 @@ fn launch(config: AppConfig) -> anyhow::Result<Launch> {
     };
     let tools = FsTools::new(&workspace)?;
     let provider: Box<dyn ModelProvider> = match config.provider {
-        ProviderChoice::Fake => Box::new(FakeProvider::echo()),
+        ProviderChoice::Fake => Box::new(FakeProvider::echo().chunk_delay(FAKE_CHUNK_DELAY)),
         ProviderChoice::OpenAi(openai) => Box::new(OpenAiProvider::new(openai)),
     };
     Ok(Launch {

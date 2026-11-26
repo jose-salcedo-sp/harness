@@ -38,7 +38,7 @@ mod contract {
             .iter()
             .filter_map(|chunk| match chunk {
                 ModelChunk::Text(text) => Some(text.as_str()),
-                ModelChunk::ToolCall(_) | ModelChunk::Usage(_) => None,
+                ModelChunk::Reasoning(_) | ModelChunk::ToolCall(_) | ModelChunk::Usage(_) => None,
             })
             .collect();
         assert!(

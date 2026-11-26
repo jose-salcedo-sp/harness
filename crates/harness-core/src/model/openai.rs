@@ -24,6 +24,46 @@ pub const BASE_URL_VAR: &str = "HARNESS_BASE_URL";
 pub const API_KEY_VAR: &str = "HARNESS_API_KEY";
 /// Base URL used when [`BASE_URL_VAR`] is unset: `llama-server`'s default address.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8080/v1";
+/// Environment variable selecting the [`ReasoningRequest`]: `llama-cpp` or `none`.
+pub const REASONING_VAR: &str = "HARNESS_REASONING";
+
+/// Which request fields ask the server to think and to stream the thoughts
+/// separately.
+///
+/// Whatever is chosen, `reasoning_content` deltas and inline `<think>` tags in
+/// the reply are both parsed into [`ModelChunk::Reasoning`](super::ModelChunk::Reasoning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ReasoningRequest {
+    /// Sends `llama-server`'s fields: `reasoning_format: "deepseek"`, so thoughts
+    /// stream as `reasoning_content`, and `chat_template_kwargs.enable_thinking`,
+    /// which turns thinking on in Qwen3-style chat templates.
+    #[default]
+    LlamaCpp,
+    /// Sends no reasoning fields, for hosted APIs that reject unknown ones.
+    None,
+}
+
+/// Why an environment value could not be parsed into a [`ReasoningRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("reasoning request `{value}` must be `llama-cpp` or `none`")]
+pub struct UnknownReasoningRequest {
+    /// The rejected value.
+    pub value: String,
+}
+
+impl std::str::FromStr for ReasoningRequest {
+    type Err = UnknownReasoningRequest;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "llama-cpp" => Ok(Self::LlamaCpp),
+            "none" => Ok(Self::None),
+            other => Err(UnknownReasoningRequest {
+                value: other.to_owned(),
+            }),
+        }
+    }
+}
 
 /// A bearer token. Its `Debug` output is redacted.
 #[derive(Clone, PartialEq, Eq)]
@@ -51,6 +91,9 @@ pub enum ConfigError {
         /// The rejected URL.
         url: String,
     },
+    /// [`REASONING_VAR`] holds an unknown value.
+    #[error("invalid {REASONING_VAR}")]
+    InvalidReasoning(#[from] UnknownReasoningRequest),
 }
 
 /// Where and how to reach the server.
@@ -58,6 +101,7 @@ pub enum ConfigError {
 pub struct OpenAiConfig {
     base_url: String,
     api_key: Option<ApiKey>,
+    reasoning: ReasoningRequest,
     connect_timeout: Duration,
     response_timeout: Duration,
     read_timeout: Duration,
@@ -79,6 +123,7 @@ impl OpenAiConfig {
         Ok(Self {
             base_url: base_url.to_owned(),
             api_key: None,
+            reasoning: ReasoningRequest::default(),
             connect_timeout: Duration::from_secs(10),
             // A local model may spend a while on prompt processing before the
             // first byte, so the wait for headers is generous.
@@ -87,24 +132,36 @@ impl OpenAiConfig {
         })
     }
 
-    /// Reads [`BASE_URL_VAR`] and [`API_KEY_VAR`] through `lookup`.
+    /// Reads [`BASE_URL_VAR`], [`API_KEY_VAR`], and [`REASONING_VAR`] through
+    /// `lookup`.
     ///
     /// Pass `|name| std::env::var(name).ok()` to read the process environment.
     /// The base URL defaults to [`DEFAULT_BASE_URL`]. The API key is optional,
-    /// because a local `llama-server` does not require one.
+    /// because a local `llama-server` does not require one. The reasoning
+    /// request defaults to [`ReasoningRequest::LlamaCpp`].
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::InvalidBaseUrl`] when the base URL is not HTTP(S).
+    /// Returns [`ConfigError::InvalidBaseUrl`] when the base URL is not HTTP(S),
+    /// and [`ConfigError::InvalidReasoning`] when [`REASONING_VAR`] is neither
+    /// `llama-cpp` nor `none`.
     pub fn from_env(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let base_url = lookup(BASE_URL_VAR).unwrap_or_else(|| DEFAULT_BASE_URL.to_owned());
-        let config = Self::new(&base_url)?;
-        Ok(
-            match lookup(API_KEY_VAR).filter(|key| !key.trim().is_empty()) {
-                Some(key) => config.api_key(ApiKey::new(key.trim())),
-                None => config,
-            },
-        )
+        let mut config = Self::new(&base_url)?;
+        if let Some(key) = lookup(API_KEY_VAR).filter(|key| !key.trim().is_empty()) {
+            config = config.api_key(ApiKey::new(key.trim()));
+        }
+        if let Some(reasoning) = lookup(REASONING_VAR).filter(|value| !value.trim().is_empty()) {
+            config = config.reasoning(reasoning.parse()?);
+        }
+        Ok(config)
+    }
+
+    /// Chooses which reasoning fields requests carry.
+    #[must_use]
+    pub fn reasoning(mut self, reasoning: ReasoningRequest) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Sends `key` as a bearer token.
@@ -151,7 +208,7 @@ impl ModelProvider for OpenAiProvider {
         let (sender, receiver) = mpsc::unbounded();
         let agent = self.agent.clone();
         let config = self.config.clone();
-        let body = request_body(&request).to_string();
+        let body = request_body(&request, self.config.reasoning).to_string();
         let spawned = std::thread::Builder::new()
             .name("harness-model-request".to_owned())
             .spawn(move || {
@@ -207,7 +264,7 @@ fn run_request(
     Ok(())
 }
 
-fn request_body(request: &ModelRequest) -> Value {
+fn request_body(request: &ModelRequest, reasoning: ReasoningRequest) -> Value {
     let mut messages = vec![json!({ "role": "system", "content": request.system.as_str() })];
     messages.extend(request.messages.iter().map(message_json));
     let mut body = serde_json::Map::new();
@@ -218,6 +275,16 @@ fn request_body(request: &ModelRequest) -> Value {
         json!({ "include_usage": true }),
     );
     body.insert("messages".to_owned(), messages.into());
+    match reasoning {
+        ReasoningRequest::LlamaCpp => {
+            body.insert("reasoning_format".to_owned(), "deepseek".into());
+            body.insert(
+                "chat_template_kwargs".to_owned(),
+                json!({ "enable_thinking": true }),
+            );
+        }
+        ReasoningRequest::None => {}
+    }
     if !request.tools.is_empty() {
         body.insert(
             "tools".to_owned(),
@@ -230,18 +297,29 @@ fn request_body(request: &ModelRequest) -> Value {
 fn message_json(message: &Message) -> Value {
     match message {
         Message::User(text) => json!({ "role": "user", "content": text.as_str() }),
-        Message::Assistant { text, tool_calls } if tool_calls.is_empty() => {
-            json!({ "role": "assistant", "content": text })
+        Message::Assistant {
+            reasoning,
+            text,
+            tool_calls,
+        } => {
+            let mut json = if tool_calls.is_empty() {
+                json!({ "role": "assistant", "content": text })
+            } else {
+                json!({
+                    "role": "assistant",
+                    "content": if text.is_empty() { Value::Null } else { Value::from(text.as_str()) },
+                    "tool_calls": tool_calls.iter().map(|call| json!({
+                        "id": call.id.as_str(),
+                        "type": "function",
+                        "function": { "name": call.name.as_str(), "arguments": call.arguments.as_str() },
+                    })).collect::<Vec<_>>(),
+                })
+            };
+            if let (Some(reasoning), Some(object)) = (reasoning, json.as_object_mut()) {
+                object.insert("reasoning_content".to_owned(), reasoning.as_str().into());
+            }
+            json
         }
-        Message::Assistant { text, tool_calls } => json!({
-            "role": "assistant",
-            "content": if text.is_empty() { Value::Null } else { Value::from(text.as_str()) },
-            "tool_calls": tool_calls.iter().map(|call| json!({
-                "id": call.id.as_str(),
-                "type": "function",
-                "function": { "name": call.name.as_str(), "arguments": call.arguments.as_str() },
-            })).collect::<Vec<_>>(),
-        }),
         Message::Tool { call_id, content } => json!({
             "role": "tool",
             "tool_call_id": call_id.as_str(),
@@ -265,7 +343,7 @@ fn tool_json(spec: &ToolSpec) -> Value {
 mod tests {
     use super::*;
     use crate::{
-        conversation::{SystemPrompt, UserText},
+        conversation::{Reasoning, SystemPrompt, UserText},
         model::ModelId,
         tool::{ToolArguments, ToolCall, ToolCallId, ToolName},
     };
@@ -319,22 +397,29 @@ mod tests {
             name: ToolName::new("read_file").unwrap(),
             arguments: ToolArguments::new(r#"{"path":"a"}"#),
         };
-        let body = request_body(&ModelRequest {
-            model: ModelId::new("bonsai-2-9b").unwrap(),
-            system: SystemPrompt::new("be brief"),
-            messages: vec![
-                Message::User(UserText::parse("read a").unwrap()),
-                Message::Assistant {
-                    text: String::new(),
-                    tool_calls: vec![call],
-                },
-                Message::Tool {
-                    call_id: ToolCallId::new("call_1").unwrap(),
-                    content: "hi".to_owned(),
-                },
-            ],
-            tools: ToolSpec::builtin(),
-        });
+        let body = request_body(
+            &ModelRequest {
+                model: ModelId::new("bonsai-2-9b").unwrap(),
+                system: SystemPrompt::new("be brief"),
+                messages: vec![
+                    Message::User(UserText::parse("read a").unwrap()),
+                    Message::Assistant {
+                        reasoning: None,
+                        text: String::new(),
+                        tool_calls: vec![call],
+                    },
+                    Message::Tool {
+                        call_id: ToolCallId::new("call_1").unwrap(),
+                        content: "hi".to_owned(),
+                    },
+                ],
+                tools: ToolSpec::builtin(),
+            },
+            ReasoningRequest::None,
+        );
+        assert!(body.get("reasoning_format").is_none());
+        assert!(body.get("chat_template_kwargs").is_none());
+        assert!(body["messages"][2].get("reasoning_content").is_none());
         assert_eq!(body["model"], "bonsai-2-9b");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][2]["content"], Value::Null);
@@ -344,5 +429,47 @@ mod tests {
         );
         assert_eq!(body["messages"][3]["tool_call_id"], "call_1");
         assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn llama_cpp_requests_ask_for_separate_reasoning() {
+        let body = request_body(
+            &ModelRequest {
+                model: ModelId::new("bonsai-2-9b").unwrap(),
+                system: SystemPrompt::new("be brief"),
+                messages: vec![
+                    Message::User(UserText::parse("hi").unwrap()),
+                    Message::Assistant {
+                        reasoning: Some(Reasoning::new("greet back").unwrap()),
+                        text: "Hello!".to_owned(),
+                        tool_calls: Vec::new(),
+                    },
+                ],
+                tools: Vec::new(),
+            },
+            ReasoningRequest::default(),
+        );
+        assert_eq!(body["reasoning_format"], "deepseek");
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["messages"][2]["reasoning_content"], "greet back");
+        assert_eq!(body["messages"][2]["content"], "Hello!");
+    }
+
+    #[test]
+    fn reads_reasoning_request_from_env() {
+        let config = OpenAiConfig::from_env(env(&[(REASONING_VAR, "none")])).unwrap();
+        assert_eq!(config.reasoning, ReasoningRequest::None);
+        assert_eq!(
+            OpenAiConfig::from_env(env(&[])).unwrap().reasoning,
+            ReasoningRequest::LlamaCpp
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_reasoning_request() {
+        assert!(matches!(
+            OpenAiConfig::from_env(env(&[(REASONING_VAR, "maybe")])),
+            Err(ConfigError::InvalidReasoning(_))
+        ));
     }
 }
